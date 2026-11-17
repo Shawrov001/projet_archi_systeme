@@ -1,4 +1,5 @@
 #include "main.h"
+#include "protocol_icd.h"
 #include <stdio.h>
 
 typedef enum {
@@ -44,7 +45,13 @@ int main(void)
     MX_USART1_UART_Init();
     MX_USART6_UART_Init();
 
+
     printf("\r\n--- Boot STM32 : Test LED & Bouton ---\r\n");
+
+    ProtocolMessage_t test_msg;
+	Protocol_BuildMessage(&test_msg, CMD_MSG, 0x42, (const uint8_t *)"PING", 4);
+	printf("[TEST-ICD] Taille=%u | CRC=0x%04X | Valide=%u\r\n",
+		   (unsigned)sizeof(ProtocolMessage_t), test_msg.crc, Protocol_VerifyMessage(&test_msg));
 
     while (1)
     {

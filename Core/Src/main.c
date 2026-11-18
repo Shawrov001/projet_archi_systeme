@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "protocol_icd.h"
+#include "security.h"
 
 
 typedef enum {
@@ -59,6 +60,18 @@ int main(void)
     MX_USART6_UART_Init();
 
     printf("\r\n--- Boot STM32 : Test RX UART1 / UART6 ---\r\n");
+
+    Security_InitPRNG();
+    uint8_t  test_id  = Security_Random8();
+    uint32_t test_key = Security_Random32();
+    uint8_t  sample[16] = "TEST_CHIFFREMENT";
+
+    Security_CryptPayload(sample, 16, test_key, 1);
+    printf("[TEST-SEC] ID=0x%02X | Cle=0x%08lX | Chiffre=%02X %02X %02X...\r\n",
+           test_id, (unsigned long)test_key, sample[0], sample[1], sample[2]);
+
+    Security_CryptPayload(sample, 16, test_key, 1);
+    printf("[TEST-SEC] Dechiffre=%.16s\r\n", sample);
 
     HAL_UART_Receive_IT(&huart1, &rx1_byte, 1);
     HAL_UART_Receive_IT(&huart6, &rx6_byte, 1);

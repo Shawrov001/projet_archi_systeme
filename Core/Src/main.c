@@ -4,7 +4,6 @@
 #include "protocol_icd.h"
 #include "security.h"
 
-
 typedef enum {
     STATE_NOT_INIT = 0,     // 1 Hz
     STATE_SYNCHRONIZING,    // 2.5 Hz
@@ -12,11 +11,22 @@ typedef enum {
     STATE_ERROR             // 5 Hz
 } SystemState_t;
 
+typedef struct {
+    uint8_t      card_id;
+    uint8_t      position;
+    NodeStatus_t status;
+    uint32_t     session_key;
+    uint8_t      has_key;
+    uint8_t      is_exit_node;
+    uint8_t      tx_nonce;
+} NodeContext_t;
+
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart6;
 
 SystemState_t current_state = STATE_NOT_INIT;
+NodeContext_t node;
 uint32_t last_led_tick = 0;
 
 // Buffers reception UART1 (amont) et UART6 (aval)
@@ -36,8 +46,10 @@ static void MX_USART1_UART_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_USART6_UART_Init(void);
 
+void Node_Reset(uint8_t send_downstream);
 void Update_LED(void);
 void Check_Button(void);
+void Process_Frame(const ProtocolMessage_t *msg);
 
 #ifdef __GNUC__
 int __io_putchar(int ch)
@@ -59,19 +71,10 @@ int main(void)
     MX_USART1_UART_Init();
     MX_USART6_UART_Init();
 
-    printf("\r\n--- Boot STM32 : Test RX UART1 / UART6 ---\r\n");
-
     Security_InitPRNG();
-    uint8_t  test_id  = Security_Random8();
-    uint32_t test_key = Security_Random32();
-    uint8_t  sample[16] = "TEST_CHIFFREMENT";
+    Node_Reset(0);
 
-    Security_CryptPayload(sample, 16, test_key, 1);
-    printf("[TEST-SEC] ID=0x%02X | Cle=0x%08lX | Chiffre=%02X %02X %02X...\r\n",
-           test_id, (unsigned long)test_key, sample[0], sample[1], sample[2]);
-
-    Security_CryptPayload(sample, 16, test_key, 1);
-    printf("[TEST-SEC] Dechiffre=%.16s\r\n", sample);
+    printf("\r\n--- Demarrage carte ID: 0x%02X ---\r\n", node.card_id);
 
     HAL_UART_Receive_IT(&huart1, &rx1_byte, 1);
     HAL_UART_Receive_IT(&huart6, &rx6_byte, 1);
@@ -81,7 +84,6 @@ int main(void)
         Update_LED();
         Check_Button();
 
-        // Test temporaire : verification reception sur USART1 et relais vers USART6
         if (rx1_ready)
         {
             ProtocolMessage_t frame_copy;
@@ -90,39 +92,26 @@ int main(void)
             rx1_ready = 0;
             __enable_irq();
 
-            uint8_t ok = Protocol_VerifyMessage(&frame_copy);
-            printf("[UART1] Trame recue | CMD=0x%02X | SRC=0x%02lX | CRC_OK=%u\r\n",
-                   frame_copy.header.command_type,
-                   (unsigned long)frame_copy.header.id_src,
-                   ok);
-
-            if (ok)
-            {
-                HAL_UART_Transmit(&huart6, (uint8_t *)&frame_copy, sizeof(ProtocolMessage_t), 100);
-            }
+            Process_Frame(&frame_copy);
         }
     }
 }
 
-void Update_LED(void)
+void Node_Reset(uint8_t send_downstream)
 {
-    uint32_t now = HAL_GetTick();
-    uint32_t period = 500; // 1 Hz par defaut
-
-    if (current_state == STATE_SYNCHRONIZED)
+    if (send_downstream)
     {
-        HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
-        return;
+        ProtocolMessage_t tx;
+        Protocol_BuildMessage(&tx, CMD_RESET, node.card_id, NULL, 0);
+        HAL_UART_Transmit(&huart6, (uint8_t *)&tx, sizeof(ProtocolMessage_t), 100);
     }
 
-    if (current_state == STATE_SYNCHRONIZING) period = 200; // 2.5 Hz
-    else if (current_state == STATE_ERROR)    period = 100; // 5 Hz
+    memset(&node, 0, sizeof(NodeContext_t));
+    node.card_id = Security_Random8();
+    node.status = STATUS_UNKNOWN;
+    current_state = STATE_NOT_INIT;
 
-    if (now - last_led_tick >= period)
-    {
-        HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-        last_led_tick = now;
-    }
+    printf("[RESET] Nouvel ID = 0x%02X\r\n", node.card_id);
 }
 
 void Check_Button(void)
@@ -147,19 +136,247 @@ void Check_Button(void)
         if (clicks >= 3)
         {
             clicks = 0;
-            current_state = STATE_NOT_INIT;
-            printf("[BTN] Triple clic -> Reset etat\r\n");
-        }
-        else
-        {
-            // Test temporaire : envoi d'une trame PING sur USART6
-            ProtocolMessage_t ping;
-            Protocol_BuildMessage(&ping, CMD_MSG, 0x01, (const uint8_t *)"PING_UART", 9);
-            HAL_UART_Transmit(&huart6, (uint8_t *)&ping, sizeof(ProtocolMessage_t), 100);
-            printf("[TEST] Trame PING envoyee sur USART6\r\n");
+            printf("[BTN] Triple clic -> Reset chaine\r\n");
+            Node_Reset(1);
         }
     }
     last_state = btn;
+}
+
+void Update_LED(void)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t period = 500; // 1 Hz par defaut
+
+    if (current_state == STATE_SYNCHRONIZED)
+    {
+        HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+        return;
+    }
+
+    if (current_state == STATE_SYNCHRONIZING) period = 200; // 2.5 Hz
+    else if (current_state == STATE_ERROR)    period = 100; // 5 Hz
+
+    if (now - last_led_tick >= period)
+    {
+        HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+        last_led_tick = now;
+    }
+}
+
+static void Send_Up(CommandType_t cmd, const uint8_t *payload, uint8_t len)
+{
+    ProtocolMessage_t tx;
+    Protocol_BuildMessage(&tx, cmd, node.card_id, payload, len);
+    HAL_UART_Transmit(&huart1, (uint8_t *)&tx, sizeof(ProtocolMessage_t), 100);
+}
+
+static uint8_t Send_Down_Wait_Ack(CommandType_t cmd, uint8_t nonce, const uint8_t *payload, uint8_t len, uint32_t timeout)
+{
+    ProtocolMessage_t tx;
+    Protocol_BuildMessage(&tx, cmd, node.card_id, payload, len);
+    tx.header.reserve = nonce;
+    tx.crc = Protocol_ComputeCRC(&tx);
+
+    __disable_irq();
+    rx6_idx = 0;
+    rx6_ready = 0;
+    __enable_irq();
+
+    HAL_UART_Transmit(&huart6, (uint8_t *)&tx, sizeof(ProtocolMessage_t), 100);
+
+    uint32_t t0 = HAL_GetTick();
+    while ((HAL_GetTick() - t0) < timeout)
+    {
+        if (rx6_ready)
+        {
+            ProtocolMessage_t resp;
+            __disable_irq();
+            memcpy(&resp, &rx6_frame, sizeof(ProtocolMessage_t));
+            rx6_ready = 0;
+            __enable_irq();
+
+            if (Protocol_VerifyMessage(&resp))
+            {
+                if (resp.header.command_type == CMD_ACK)
+                    return 1;
+                if (resp.header.command_type == CMD_ERROR)
+                    return 0;
+            }
+        }
+    }
+    return 0;
+}
+
+void Process_Frame(const ProtocolMessage_t *msg)
+{
+    if (!Protocol_VerifyMessage(msg))
+    {
+        printf("[ERR] Trame ou CRC invalide\r\n");
+        current_state = STATE_ERROR;
+        Send_Up(CMD_ERROR, NULL, 0);
+        return;
+    }
+
+    CommandType_t cmd = (CommandType_t)msg->header.command_type;
+
+    if (cmd == CMD_RESET)
+    {
+        Send_Up(CMD_ACK, NULL, 0);
+        Node_Reset(1);
+        return;
+    }
+
+    if (cmd == CMD_GET_INFO)
+    {
+        uint8_t info[3] = { node.card_id, node.position, (uint8_t)node.status };
+        Send_Up(CMD_GET_INFO, info, 3);
+        printf("[INFO] ID=0x%02X | Pos=%d | Statut=%d\r\n", info[0], info[1], info[2]);
+        return;
+    }
+
+    if (cmd == CMD_GET_KEY)
+    {
+        uint8_t k[4];
+        memcpy(k, &node.session_key, 4);
+        Send_Up(CMD_GET_KEY, k, 4);
+        printf("[KEY] Cle=0x%08lX\r\n", (unsigned long)node.session_key);
+        return;
+    }
+
+    if (current_state == STATE_ERROR)
+    {
+        printf("[BLOQUE] Carte en erreur, RESET requis\r\n");
+        Send_Up(CMD_ERROR, NULL, 0);
+        return;
+    }
+
+    if (cmd == CMD_INIT)
+    {
+        if (current_state != STATE_NOT_INIT)
+        {
+            current_state = STATE_ERROR;
+            Send_Up(CMD_ERROR, NULL, 0);
+            return;
+        }
+
+        current_state = STATE_SYNCHRONIZING;
+
+        uint8_t prev_pos = (msg->header.length >= 1) ? msg->payload[0] : 0;
+        node.position = prev_pos + 1;
+        node.status = (node.position == 1) ? STATUS_MASTER : STATUS_SLAVE;
+
+        uint8_t my_pos[1] = { node.position };
+        if (Send_Down_Wait_Ack(CMD_INIT, 0, my_pos, 1, 300))
+            node.is_exit_node = 0;
+        else
+            node.is_exit_node = 1;
+
+        Send_Up(CMD_ACK, NULL, 0);
+
+        if (node.status == STATUS_MASTER)
+        {
+            node.session_key = Security_Random32();
+            node.has_key = 1;
+
+            if (!node.is_exit_node)
+            {
+                uint8_t key_buf[4];
+                memcpy(key_buf, &node.session_key, 4);
+                if (Send_Down_Wait_Ack(CMD_UPDT_KEY, 0, key_buf, 4, 300))
+                {
+                    current_state = STATE_SYNCHRONIZED;
+                    printf("[OK] Maitre synchronise (cle: 0x%08lX)\r\n", (unsigned long)node.session_key);
+                }
+                else
+                {
+                    current_state = STATE_ERROR;
+                }
+            }
+            else
+            {
+                current_state = STATE_SYNCHRONIZED;
+                printf("[OK] Maitre unique synchronise (cle: 0x%08lX)\r\n", (unsigned long)node.session_key);
+            }
+        }
+        else
+        {
+            printf("[INIT] Esclave pos %d pret, attente cle...\r\n", node.position);
+        }
+        return;
+    }
+
+    if (cmd == CMD_UPDT_KEY)
+    {
+        if (current_state != STATE_SYNCHRONIZING || node.status != STATUS_SLAVE)
+        {
+            printf("[ERR] UPDT_KEY recu hors synchro\r\n");
+            current_state = STATE_ERROR;
+            Send_Up(CMD_ERROR, NULL, 0);
+            return;
+        }
+
+        memcpy(&node.session_key, msg->payload, 4);
+        node.has_key = 1;
+
+        if (!node.is_exit_node)
+        {
+            if (!Send_Down_Wait_Ack(CMD_UPDT_KEY, 0, msg->payload, 4, 300))
+            {
+                current_state = STATE_ERROR;
+                Send_Up(CMD_ERROR, NULL, 0);
+                return;
+            }
+        }
+
+        current_state = STATE_SYNCHRONIZED;
+        Send_Up(CMD_ACK, NULL, 0);
+        printf("[OK] Esclave pos %d synchronise (cle: 0x%08lX)\r\n", node.position, (unsigned long)node.session_key);
+        return;
+    }
+
+    if (cmd == CMD_MSG)
+    {
+        if (current_state != STATE_SYNCHRONIZED || !node.has_key)
+        {
+            Send_Up(CMD_ERROR, NULL, 0);
+            return;
+        }
+
+        uint8_t data[MAX_PAYLOAD_SIZE];
+        memcpy(data, msg->payload, MAX_PAYLOAD_SIZE);
+        uint8_t nonce = msg->header.reserve;
+
+        if (node.position == 1)
+        {
+            node.tx_nonce++;
+            nonce = node.tx_nonce;
+            printf("[TX] Clair: %.16s (nonce=%d)\r\n", data, nonce);
+            Security_CryptPayload(data, MAX_PAYLOAD_SIZE, node.session_key, nonce);
+        }
+
+        if (!node.is_exit_node)
+        {
+            if (!Send_Down_Wait_Ack(CMD_MSG, nonce, data, MAX_PAYLOAD_SIZE, 200))
+            {
+                printf("[ERR] Echec relais vers carte aval\r\n");
+                current_state = STATE_ERROR;
+                Send_Up(CMD_ERROR, NULL, 0);
+                return;
+            }
+            Send_Up(CMD_ACK, NULL, 0);
+        }
+        else
+        {
+            Send_Up(CMD_ACK, NULL, 0);
+            Security_CryptPayload(data, MAX_PAYLOAD_SIZE, node.session_key, nonce);
+            printf("[RX] Dechiffre: %.16s\r\n", data);
+
+            ProtocolMessage_t out_msg;
+            Protocol_BuildMessage(&out_msg, CMD_MSG, node.card_id, data, MAX_PAYLOAD_SIZE);
+            HAL_UART_Transmit(&huart6, (uint8_t *)&out_msg, sizeof(ProtocolMessage_t), 100);
+        }
+    }
 }
 
 void USART1_IRQHandler(void) { HAL_UART_IRQHandler(&huart1); }

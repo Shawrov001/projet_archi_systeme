@@ -1,6 +1,8 @@
 #include "main.h"
-#include "protocol_icd.h"
 #include <stdio.h>
+#include <string.h>
+#include "protocol_icd.h"
+
 
 typedef enum {
     STATE_NOT_INIT = 0,     // 1 Hz
@@ -15,6 +17,17 @@ UART_HandleTypeDef huart6;
 
 SystemState_t current_state = STATE_NOT_INIT;
 uint32_t last_led_tick = 0;
+
+// Buffers reception UART1 (amont) et UART6 (aval)
+uint8_t rx1_byte, rx1_buf[ICD_FRAME_SIZE], rx1_idx = 0;
+uint32_t rx1_last_tick = 0;
+ProtocolMessage_t rx1_frame;
+volatile uint8_t rx1_ready = 0;
+
+uint8_t rx6_byte, rx6_buf[ICD_FRAME_SIZE], rx6_idx = 0;
+uint32_t rx6_last_tick = 0;
+ProtocolMessage_t rx6_frame;
+volatile uint8_t rx6_ready = 0;
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -45,18 +58,36 @@ int main(void)
     MX_USART1_UART_Init();
     MX_USART6_UART_Init();
 
+    printf("\r\n--- Boot STM32 : Test RX UART1 / UART6 ---\r\n");
 
-    printf("\r\n--- Boot STM32 : Test LED & Bouton ---\r\n");
-
-    ProtocolMessage_t test_msg;
-	Protocol_BuildMessage(&test_msg, CMD_MSG, 0x42, (const uint8_t *)"PING", 4);
-	printf("[TEST-ICD] Taille=%u | CRC=0x%04X | Valide=%u\r\n",
-		   (unsigned)sizeof(ProtocolMessage_t), test_msg.crc, Protocol_VerifyMessage(&test_msg));
+    HAL_UART_Receive_IT(&huart1, &rx1_byte, 1);
+    HAL_UART_Receive_IT(&huart6, &rx6_byte, 1);
 
     while (1)
     {
         Update_LED();
         Check_Button();
+
+        // Test temporaire : verification reception sur USART1 et relais vers USART6
+        if (rx1_ready)
+        {
+            ProtocolMessage_t frame_copy;
+            __disable_irq();
+            memcpy(&frame_copy, &rx1_frame, sizeof(ProtocolMessage_t));
+            rx1_ready = 0;
+            __enable_irq();
+
+            uint8_t ok = Protocol_VerifyMessage(&frame_copy);
+            printf("[UART1] Trame recue | CMD=0x%02X | SRC=0x%02lX | CRC_OK=%u\r\n",
+                   frame_copy.header.command_type,
+                   (unsigned long)frame_copy.header.id_src,
+                   ok);
+
+            if (ok)
+            {
+                HAL_UART_Transmit(&huart6, (uint8_t *)&frame_copy, sizeof(ProtocolMessage_t), 100);
+            }
+        }
     }
 }
 
@@ -104,16 +135,67 @@ void Check_Button(void)
         {
             clicks = 0;
             current_state = STATE_NOT_INIT;
-            printf("[BTN] Triple clic -> Reset etat (STATE_NOT_INIT)\r\n");
+            printf("[BTN] Triple clic -> Reset etat\r\n");
         }
         else
         {
-            // Test temporaire : change l'etat LED a chaque appui
-            current_state = (SystemState_t)((current_state + 1) % 4);
-            printf("[TEST] Nouvel etat LED = %d\r\n", current_state);
+            // Test temporaire : envoi d'une trame PING sur USART6
+            ProtocolMessage_t ping;
+            Protocol_BuildMessage(&ping, CMD_MSG, 0x01, (const uint8_t *)"PING_UART", 9);
+            HAL_UART_Transmit(&huart6, (uint8_t *)&ping, sizeof(ProtocolMessage_t), 100);
+            printf("[TEST] Trame PING envoyee sur USART6\r\n");
         }
     }
     last_state = btn;
+}
+
+void USART1_IRQHandler(void) { HAL_UART_IRQHandler(&huart1); }
+void USART6_IRQHandler(void) { HAL_UART_IRQHandler(&huart6); }
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    uint32_t now = HAL_GetTick();
+
+    if (huart->Instance == USART1)
+    {
+        if (rx1_idx > 0 && (now - rx1_last_tick > 30)) rx1_idx = 0;
+        rx1_last_tick = now;
+
+        if (rx1_idx > 0 || rx1_byte == ICD_START_BYTE)
+        {
+            rx1_buf[rx1_idx++] = rx1_byte;
+            if (rx1_idx >= ICD_FRAME_SIZE)
+            {
+                if (!rx1_ready)
+                {
+                    memcpy(&rx1_frame, rx1_buf, ICD_FRAME_SIZE);
+                    rx1_ready = 1;
+                }
+                rx1_idx = 0;
+            }
+        }
+        HAL_UART_Receive_IT(&huart1, &rx1_byte, 1);
+    }
+    else if (huart->Instance == USART6)
+    {
+        if (rx6_idx > 0 && (now - rx6_last_tick > 30)) rx6_idx = 0;
+        rx6_last_tick = now;
+
+        if (rx6_idx > 0 || rx6_byte == ICD_START_BYTE)
+        {
+            rx6_buf[rx6_idx++] = rx6_byte;
+            if (rx6_idx >= ICD_FRAME_SIZE)
+            {
+                if (!rx6_ready)
+                {
+                    memcpy(&rx6_frame, rx6_buf, ICD_FRAME_SIZE);
+                    rx6_ready = 1;
+                }
+                rx6_idx = 0;
+            }
+        }
+        HAL_UART_Receive_IT(&huart6, &rx6_byte, 1);
+    }
 }
 
 void SystemClock_Config(void)
@@ -146,6 +228,17 @@ void SystemClock_Config(void)
 
 static void MX_USART1_UART_Init(void)
 {
+    __HAL_RCC_USART1_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_9 | GPIO_PIN_10;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
     huart1.Instance = USART1;
     huart1.Init.BaudRate = 115200;
     huart1.Init.WordLength = UART_WORDLENGTH_8B;
@@ -155,6 +248,9 @@ static void MX_USART1_UART_Init(void)
     huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart1.Init.OverSampling = UART_OVERSAMPLING_16;
     if (HAL_UART_Init(&huart1) != HAL_OK) Error_Handler();
+
+    HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(USART1_IRQn);
 }
 
 static void MX_USART2_UART_Init(void)
@@ -172,6 +268,17 @@ static void MX_USART2_UART_Init(void)
 
 static void MX_USART6_UART_Init(void)
 {
+    __HAL_RCC_USART6_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_6 | GPIO_PIN_7;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF8_USART6;
+    HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
     huart6.Instance = USART6;
     huart6.Init.BaudRate = 115200;
     huart6.Init.WordLength = UART_WORDLENGTH_8B;
@@ -181,6 +288,9 @@ static void MX_USART6_UART_Init(void)
     huart6.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart6.Init.OverSampling = UART_OVERSAMPLING_16;
     if (HAL_UART_Init(&huart6) != HAL_OK) Error_Handler();
+
+    HAL_NVIC_SetPriority(USART6_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(USART6_IRQn);
 }
 
 static void MX_GPIO_Init(void)

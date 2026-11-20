@@ -19,6 +19,8 @@ typedef struct {
     uint8_t      has_key;
     uint8_t      is_exit_node;
     uint8_t      tx_nonce;
+    uint32_t     up_id;
+    uint32_t     down_id;
 } NodeContext_t;
 
 UART_HandleTypeDef huart1;
@@ -171,7 +173,7 @@ static void Send_Up(CommandType_t cmd, const uint8_t *payload, uint8_t len)
     HAL_UART_Transmit(&huart1, (uint8_t *)&tx, sizeof(ProtocolMessage_t), 100);
 }
 
-static uint8_t Send_Down_Wait_Ack(CommandType_t cmd, uint8_t nonce, const uint8_t *payload, uint8_t len, uint32_t timeout)
+static uint8_t Send_Down_Wait_Ack(CommandType_t cmd, uint8_t nonce, const uint8_t *payload, uint8_t len, uint32_t timeout, uint32_t *ack_src)
 {
     ProtocolMessage_t tx;
     Protocol_BuildMessage(&tx, cmd, node.card_id, payload, len);
@@ -199,7 +201,10 @@ static uint8_t Send_Down_Wait_Ack(CommandType_t cmd, uint8_t nonce, const uint8_
             if (Protocol_VerifyMessage(&resp))
             {
                 if (resp.header.command_type == CMD_ACK)
+                {
+                    if (ack_src) *ack_src = resp.header.id_src;
                     return 1;
+                }
                 if (resp.header.command_type == CMD_ERROR)
                     return 0;
             }
@@ -251,6 +256,16 @@ void Process_Frame(const ProtocolMessage_t *msg)
         return;
     }
 
+    // Verification de l'ID de la carte amont
+    if (current_state != STATE_NOT_INIT && msg->header.id_src != node.up_id)
+    {
+        printf("[ERR] Changement de carte amont detecte (attendu 0x%02lX, recu 0x%02lX)\r\n",
+               (unsigned long)node.up_id, (unsigned long)msg->header.id_src);
+        current_state = STATE_ERROR;
+        Send_Up(CMD_ERROR, NULL, 0);
+        return;
+    }
+
     if (cmd == CMD_INIT)
     {
         if (current_state != STATE_NOT_INIT)
@@ -261,16 +276,23 @@ void Process_Frame(const ProtocolMessage_t *msg)
         }
 
         current_state = STATE_SYNCHRONIZING;
+        node.up_id = msg->header.id_src;
 
         uint8_t prev_pos = (msg->header.length >= 1) ? msg->payload[0] : 0;
         node.position = prev_pos + 1;
         node.status = (node.position == 1) ? STATUS_MASTER : STATUS_SLAVE;
 
         uint8_t my_pos[1] = { node.position };
-        if (Send_Down_Wait_Ack(CMD_INIT, 0, my_pos, 1, 300))
+        uint32_t next_id = 0;
+        if (Send_Down_Wait_Ack(CMD_INIT, 0, my_pos, 1, 300, &next_id))
+        {
             node.is_exit_node = 0;
+            node.down_id = next_id;
+        }
         else
+        {
             node.is_exit_node = 1;
+        }
 
         Send_Up(CMD_ACK, NULL, 0);
 
@@ -283,7 +305,8 @@ void Process_Frame(const ProtocolMessage_t *msg)
             {
                 uint8_t key_buf[4];
                 memcpy(key_buf, &node.session_key, 4);
-                if (Send_Down_Wait_Ack(CMD_UPDT_KEY, 0, key_buf, 4, 300))
+                uint32_t ack_id = 0;
+                if (Send_Down_Wait_Ack(CMD_UPDT_KEY, 0, key_buf, 4, 300, &ack_id) && ack_id == node.down_id)
                 {
                     current_state = STATE_SYNCHRONIZED;
                     printf("[OK] Maitre synchronise (cle: 0x%08lX)\r\n", (unsigned long)node.session_key);
@@ -321,7 +344,8 @@ void Process_Frame(const ProtocolMessage_t *msg)
 
         if (!node.is_exit_node)
         {
-            if (!Send_Down_Wait_Ack(CMD_UPDT_KEY, 0, msg->payload, 4, 300))
+            uint32_t ack_id = 0;
+            if (!Send_Down_Wait_Ack(CMD_UPDT_KEY, 0, msg->payload, 4, 300, &ack_id) || ack_id != node.down_id)
             {
                 current_state = STATE_ERROR;
                 Send_Up(CMD_ERROR, NULL, 0);
@@ -357,9 +381,10 @@ void Process_Frame(const ProtocolMessage_t *msg)
 
         if (!node.is_exit_node)
         {
-            if (!Send_Down_Wait_Ack(CMD_MSG, nonce, data, MAX_PAYLOAD_SIZE, 200))
+            uint32_t ack_id = 0;
+            if (!Send_Down_Wait_Ack(CMD_MSG, nonce, data, MAX_PAYLOAD_SIZE, 200, &ack_id) || ack_id != node.down_id)
             {
-                printf("[ERR] Echec relais vers carte aval\r\n");
+                printf("[ERR] Perte ou changement carte aval\r\n");
                 current_state = STATE_ERROR;
                 Send_Up(CMD_ERROR, NULL, 0);
                 return;
@@ -424,6 +449,24 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                 rx6_idx = 0;
             }
         }
+        HAL_UART_Receive_IT(&huart6, &rx6_byte, 1);
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    __HAL_UART_CLEAR_FEFLAG(huart);
+    __HAL_UART_CLEAR_NEFLAG(huart);
+
+    if (huart->Instance == USART1)
+    {
+        rx1_idx = 0;
+        HAL_UART_Receive_IT(&huart1, &rx1_byte, 1);
+    }
+    else if (huart->Instance == USART6)
+    {
+        rx6_idx = 0;
         HAL_UART_Receive_IT(&huart6, &rx6_byte, 1);
     }
 }

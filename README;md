@@ -1,0 +1,35 @@
+# Chaîne de communication sécurisée sur STM32 (Nucleo-F401RE)
+
+Implémentation d'un protocole de relais chiffré point-à-point sur liaison série UART entre plusieurs cartes STM32.
+
+## Brochage (Nucleo-F401RE)
+
+| Interface | Broches | Rôle |
+| :--- | :--- | :--- |
+| `USART1` | `PA9` (TX), `PA10` (RX) | Entrée amont (PC ou carte $N-1$) |
+| `USART6` | `PC6` (TX), `PC7` (RX) | Sortie aval (carte $N+1$ ou sortie) |
+| `USART2` | `PA2` (TX), `PA3` (RX) | Console debug ST-Link (115200 bauds) |
+| `LD2` | `PA5` | LED d'état |
+| `B1` | `PC13` | Bouton utilisateur (triple clic = reset chaîne) |
+
+### Chaînage entre deux cartes
+* `PC6` (Carte $N$) $\rightarrow$ `PA10` (Carte $N+1$)
+* `PC7` (Carte $N$) $\leftarrow$ `PA9` (Carte $N+1$)
+* `GND` $\leftrightarrow$ `GND`
+
+## États de la LED `LD2`
+* **Clignotement lent (1 Hz)** : non initialisé (`STATE_NOT_INIT`)
+* **Clignotement moyen (2,5 Hz)** : synchronisation en cours (`STATE_SYNCHRONIZING`)
+* **Allumée fixe** : carte synchronisée et opérationnelle (`STATE_SYNCHRONIZED`)
+* **Clignotement rapide (5 Hz)** : erreur détectée (`STATE_ERROR` : CRC invalide, perte de liaison ou changement de carte)
+
+## Console de test série (`#ifdef TEST_CONSOLE`)
+Permet d'injecter des trames ICD directement depuis le terminal PC connecté sur `USART2` (115200 bauds) :
+
+* `i` : envoyer `CMD_INIT` (initialisation de la chaîne et distribution de la clé)
+* `m` : envoyer un message chiffré de 16 octets (`CMD_MSG`)
+* `b` : envoyer une rafale de 300 messages
+* `g` / `k` : interroger l'état (`CMD_GET_INFO`) et la clé de session (`CMD_GET_KEY`)
+* `c` : simuler une trame avec CRC corrompu
+* `f` : simuler un changement d'identifiant source (`id_src` invalide)
+* `r` : envoyer `CMD_RESET` pour réinitialiser la chaîne

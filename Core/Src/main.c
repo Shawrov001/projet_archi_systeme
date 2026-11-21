@@ -4,6 +4,8 @@
 #include "protocol_icd.h"
 #include "security.h"
 
+#define TEST_CONSOLE // Permet de piloter la carte depuis le terminal PC
+
 typedef enum {
     STATE_NOT_INIT = 0,     // 1 Hz
     STATE_SYNCHRONIZING,    // 2.5 Hz
@@ -53,6 +55,65 @@ void Update_LED(void);
 void Check_Button(void);
 void Process_Frame(const ProtocolMessage_t *msg);
 
+#ifdef TEST_CONSOLE
+#define FAKE_PC_ID 0xE0
+static uint8_t console_rx;
+static volatile uint8_t console_cmd = 0;
+
+static void Test_Inject(CommandType_t cmd, const uint8_t *p, uint8_t len, uint8_t bad_crc, uint32_t src)
+{
+    ProtocolMessage_t m;
+    Protocol_BuildMessage(&m, cmd, src, p, len);
+    if (bad_crc) m.crc ^= 0x0001;
+    Process_Frame(&m);
+}
+
+static void Test_Console_Process(void)
+{
+    if (!console_cmd) return;
+    uint8_t c = console_cmd;
+    console_cmd = 0;
+
+    uint8_t key_p[4] = { 0x11, 0x22, 0x33, 0x44 };
+    uint8_t txt[16];
+    static uint8_t n = 0;
+    memset(txt, 0, sizeof(txt));
+    snprintf((char *)txt, sizeof(txt), "HELLO-%03u", (unsigned)n);
+
+    switch (c) {
+    case 'i': Test_Inject(CMD_INIT,     NULL,  0, 0, FAKE_PC_ID);     break;
+    case 'r': Test_Inject(CMD_RESET,    NULL,  0, 0, FAKE_PC_ID);     break;
+    case 'g': Test_Inject(CMD_GET_INFO, NULL,  0, 0, FAKE_PC_ID);     break;
+    case 'k': Test_Inject(CMD_GET_KEY,  NULL,  0, 0, FAKE_PC_ID);     break;
+    case 'm': n++; Test_Inject(CMD_MSG, txt,  16, 0, FAKE_PC_ID);     break;
+    case 'c': n++; Test_Inject(CMD_MSG, txt,  16, 1, FAKE_PC_ID);     break;
+    case 'f': n++; Test_Inject(CMD_MSG, txt,  16, 0, FAKE_PC_ID + 1); break;
+    case 'u': Test_Inject(CMD_UPDT_KEY, key_p, 4, 0, FAKE_PC_ID);     break;
+    case 'b':
+        for (int i = 0; i < 300; i++) {
+            n++;
+            snprintf((char *)txt, 16, "BURST-%03u", (unsigned)n);
+            Test_Inject(CMD_MSG, txt, 16, 0, FAKE_PC_ID);
+        }
+        break;
+    case 'j': {
+        uint8_t junk[4] = { 0x00, 0xFF, 0x13, 0x37 };
+        ProtocolMessage_t m;
+        Protocol_BuildMessage(&m, CMD_MSG, node.card_id, txt, 16);
+        HAL_UART_Transmit(&huart6, junk, 4, 100);
+        HAL_UART_Transmit(&huart6, (uint8_t *)&m, sizeof(m), 100);
+    } break;
+    case 't': {
+        ProtocolMessage_t m;
+        Protocol_BuildMessage(&m, CMD_MSG, node.card_id, txt, 16);
+        HAL_UART_Transmit(&huart6, (uint8_t *)&m, 10, 100);
+        HAL_Delay(50);
+        HAL_UART_Transmit(&huart6, (uint8_t *)&m, sizeof(m), 100);
+    } break;
+    }
+}
+#endif
+
 #ifdef __GNUC__
 int __io_putchar(int ch)
 #else
@@ -81,10 +142,18 @@ int main(void)
     HAL_UART_Receive_IT(&huart1, &rx1_byte, 1);
     HAL_UART_Receive_IT(&huart6, &rx6_byte, 1);
 
+#ifdef TEST_CONSOLE
+    HAL_UART_Receive_IT(&huart2, &console_rx, 1);
+#endif
+
     while (1)
     {
         Update_LED();
         Check_Button();
+
+#ifdef TEST_CONSOLE
+        Test_Console_Process();
+#endif
 
         if (rx1_ready)
         {
@@ -284,7 +353,9 @@ void Process_Frame(const ProtocolMessage_t *msg)
 
         uint8_t my_pos[1] = { node.position };
         uint32_t next_id = 0;
-        if (Send_Down_Wait_Ack(CMD_INIT, 0, my_pos, 1, 300, &next_id))
+        uint32_t init_timeout = (node.position < 8) ? (800 - node.position * 100) : 100;
+
+        if (Send_Down_Wait_Ack(CMD_INIT, 0, my_pos, 1, init_timeout, &next_id))
         {
             node.is_exit_node = 0;
             node.down_id = next_id;
@@ -394,6 +465,11 @@ void Process_Frame(const ProtocolMessage_t *msg)
         else
         {
             Send_Up(CMD_ACK, NULL, 0);
+#ifdef TEST_CONSOLE
+            printf("[RX] Chiffre recu: ");
+            for (uint8_t i = 0; i < MAX_PAYLOAD_SIZE; i++) printf("%02X ", data[i]);
+            printf("\r\n");
+#endif
             Security_CryptPayload(data, MAX_PAYLOAD_SIZE, node.session_key, nonce);
             printf("[RX] Dechiffre: %.16s\r\n", data);
 
@@ -405,6 +481,7 @@ void Process_Frame(const ProtocolMessage_t *msg)
 }
 
 void USART1_IRQHandler(void) { HAL_UART_IRQHandler(&huart1); }
+void USART2_IRQHandler(void) { HAL_UART_IRQHandler(&huart2); }
 void USART6_IRQHandler(void) { HAL_UART_IRQHandler(&huart6); }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
@@ -451,6 +528,13 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         }
         HAL_UART_Receive_IT(&huart6, &rx6_byte, 1);
     }
+#ifdef TEST_CONSOLE
+    else if (huart->Instance == USART2)
+    {
+        console_cmd = console_rx;
+        HAL_UART_Receive_IT(&huart2, &console_rx, 1);
+    }
+#endif
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
@@ -469,6 +553,12 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
         rx6_idx = 0;
         HAL_UART_Receive_IT(&huart6, &rx6_byte, 1);
     }
+#ifdef TEST_CONSOLE
+    else if (huart->Instance == USART2)
+    {
+        HAL_UART_Receive_IT(&huart2, &console_rx, 1);
+    }
+#endif
 }
 
 void SystemClock_Config(void)
@@ -528,6 +618,17 @@ static void MX_USART1_UART_Init(void)
 
 static void MX_USART2_UART_Init(void)
 {
+    __HAL_RCC_USART2_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_3;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
     huart2.Instance = USART2;
     huart2.Init.BaudRate = 115200;
     huart2.Init.WordLength = UART_WORDLENGTH_8B;
@@ -537,6 +638,9 @@ static void MX_USART2_UART_Init(void)
     huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart2.Init.OverSampling = UART_OVERSAMPLING_16;
     if (HAL_UART_Init(&huart2) != HAL_OK) Error_Handler();
+
+    HAL_NVIC_SetPriority(USART2_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(USART2_IRQn);
 }
 
 static void MX_USART6_UART_Init(void)
